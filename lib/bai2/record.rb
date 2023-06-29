@@ -132,7 +132,7 @@ module Bai2
     # away in case they might be merged with a continuation.
     #
     def fields
-      @fields ||= parse_raw(@code, @raw)
+      @fields ||= parse_raw(@code, @raw, 0)
     end
 
     # A record can be accessed like a hash.
@@ -143,18 +143,24 @@ module Bai2
 
     private
 
-    def parse_raw(code, line)
+    # every parse_* method here should return { key: value, start: 0, length: 0 }
+    def parse_raw(code, line, line_number)
 
       fields = (SIMPLE_FIELD_MAP[code] || [])
       if !fields.empty?
-        split = line.split(',', fields.count).map(&:strip)
-        Hash[fields.zip(split).map do |k,v|
-          next [k,v] if k.is_a?(Symbol)
-          key, block = k
-          [key, block.to_proc.call(v)]
-        end]
+        starts = ([0] + Array(0...line.length).select { |i| line[i] == "," }.map(&:next))[0...fields.count]
+        split = line.split(',', fields.count) # .map(&:strip)
+        lengths = split.map(&:length)
+        stripped_split = split.map(&:strip)
+        hash_stuff = fields.zip(stripped_split, starts, lengths).map do |field, str, start, len|
+          next [field, str, "#{field}_start".to_sym, start, "#{field}_length".to_sym, len] if field.is_a?(Symbol)
+
+          key, block = field
+          [key, block.to_proc.call(str), "#{key}_start".to_sym, start, "#{key}_length".to_sym, len]
+        end
+        Hash[*hash_stuff.flatten]
       elsif respond_to?("parse_#{code}_fields".to_sym, true)
-        send("parse_#{code}_fields".to_sym, line)
+        send("parse_#{code}_fields".to_sym, line, line_number)
       else
         raise ParseError.new('Unknown record code.')
       end
@@ -165,20 +171,36 @@ module Bai2
     # The rules here are pulled from the specification at this URL:
     # http://www.bai.org/Libraries/Site-General-Downloads/Cash_Management_2005.sflb.ashx
     #
-    def parse_transaction_detail_fields(record)
-
+    def parse_transaction_detail_fields(record, line_number)
       # split out the constant bits
-      record_code, type_code, amount, funds_type, rest = record.split(',', 5).map(&:strip)
+      starts = ([0] + Array(0...record.length-1).select { |i| record[i] == "," && record[i+1] != "," }.map(&:next))[0...5]
+      split = record.split(',', 5)
+      lengths = split.map(&:length)
+      record_code, type_code, amount, funds_type, rest = split.map(&:strip)
+      record_code_start, type_start, amount_start, funds_type_start, rest_start = starts
+      record_code_len, type_len, amount_len, funds_type_len, rest_len = lengths
 
       common = {
         record_code: record_code,
-        type:        ParseTypeCode[type_code],
+        record_code_start: record_code_start,
+        record_code_len: record_code_len,
+        line_number: ,
+
+        type: ParseTypeCode[type_code],
+        type_start: type_start,
+        type_len: type_len,
+
         amount:      amount.to_i,
+        amount_start: amount_start,
+        amount_length: amount_len,
+
         funds_type:  funds_type,
+        funds_type_start: funds_type_start,
+        funds_type_len: funds_type_len,
       }
 
       # handle funds_type logic
-      funds_info, rest = *parse_funds_type(funds_type, rest)
+      funds_info, rest = *parse_funds_type(funds_type, rest, rest_start)
       with_funds_availability = common.merge(funds_info)
 
       # split the rest of the constant fields
@@ -192,32 +214,48 @@ module Bai2
     end
 
     def parse_account_identifier_fields(record)
-
       # split out the constant bits
-      record_code, customer, currency_code, rest = record.split(',', 4).map(&:strip)
+      # record_code, customer, currency_code, rest = record.split(',', 4).map(&:strip)
+
+      starts = ([0] + Array(0...record.length).select { |i| record[i] == "," }.map(&:next))[0...4]
+      split = record.split(',', 4)
+      lengths = split.map(&:length)
+      record_code, customer, currency_code, rest = split.map(&:strip)
+      record_code_start, customer_start, currency_code_start, rest_start = starts
+      record_code_len, customer_len, currency_code_len, rest_len = lengths
 
       common = {
-        record_code:   record_code,
-        customer:      customer,
+        record_code: record_code,
+        record_code_start: record_code_start,
+        record_code_length: record_code_len,
+
+        customer: customer,
+        customer_start: customer_start,
+        customer_length: customer_len,
+
         currency_code: currency_code,
-        summaries:     [],
+        currency_code_start: currency_code_start,
+        currency_code_length: currency_code_len,
+
+        summaries: []
       }
 
       # sadly, imperative style seems cleaner. would prefer it functional.
       until rest.nil? || rest.empty?
 
+        # TODO
         type_code, amount, items_count, funds_type, rest \
           = rest.split(',', 5).map(&:strip)
 
         amount_details = {
-          type:          ParseTypeCode[type_code],
-          amount:        amount.to_i,
-          items_count:   items_count,
-          funds_type:    funds_type,
+          type: ParseTypeCode[type_code],
+          amount: amount.to_i,
+          items_count: items_count,
+          funds_type: funds_type
         }
 
         # handle funds_type logic
-        funds_info, rest = *parse_funds_type(funds_type, rest)
+        funds_info, rest = *parse_funds_type(funds_type, rest, rest_start)
         with_funds_availability = amount_details.merge(funds_info)
 
         common[:summaries] << with_funds_availability
@@ -232,25 +270,41 @@ module Bai2
     #   funds_type, rest = ...
     #   funds_info, rest = *parse_funds_type(funds_type, rest)
     #
-    def parse_funds_type(funds_type, rest)
+    def parse_funds_type(funds_type, rest, rest_start)
       info = \
         case funds_type
         when 'S'
-          now, next_day, later, rest = rest.split(',', 4).map(&:strip)
+          # now, next_day, later, rest = rest.split(',', 4).map(&:strip)
+          starts = ([0] + Array(0...rest.length).select { |i| rest[i] == "," }.map(&:next))[0...4]
+          split = record.split(',', 4)
+          lengths = split.map(&:length)
+          now, next_day, later, rest = split.map(&:strip)
+          now_start, next_day_start, later_start, rest_start = starts
+          now_len, next_day_len, later_len, rest_len = lengths
           {
             availability: [
               {day: 0,    amount: now},
               {day: 1,    amount: now},
               {day: '>1', amount: now},
-            ]
+            ],
+            availability_start: rest_start + now_start,
+            availability_length: rest.length - rest_len
           }
         when 'V'
-          value_date, value_hour, rest = rest.split(',', 3).map(&:strip)
+          # value_date, value_hour, rest = rest.split(',', 3).map(&:strip)
+          starts = ([0] + Array(0...line.length).select { |i| rest[i] == "," }.map(&:next))[0...3]
+          split = record.split(',', 3)
+          lengths = split.map(&:length)
+          value_date, _, _, rest = split.map(&:strip)
+          value_date_start, = starts
+          value_date_len, value_hour_len, rest_len = lengths
           value_hour = '2400' if value_hour == '9999'
           {
-            value_dated: {date: value_date, hour: value_hour}
+            value_dated: {date: value_date, hour: value_hour},
+            value_date_start: rest_start + value_date_start,
+            value_date_length: rest.length - rest_len
           }
-        when 'D'
+        when 'D' # TODOO
           field_count, rest = rest.split(',', 2).map(&:strip)
           availability = field_count.to_i.times.map do
             days, amount, rest = rest.split(',', 3).map(&:strip)

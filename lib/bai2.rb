@@ -172,7 +172,6 @@ module Bai2
 
       attr_reader_from_ivar_hash :@record,
         :amount, :text, :type, :bank_reference, :customer_reference
-
       def debit?
         type[:transaction] == :debit
       end
@@ -196,6 +195,7 @@ module Bai2
         end
 
         @record = head
+        # @line_number = n.line_number
       end
 
     end
